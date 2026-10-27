@@ -1,10 +1,14 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.core.config import settings
+from app.api.endpoints import router as api_router
 
-app = FastAPI(title=settings.PROJECT_NAME)
+app = FastAPI(
+    title="AI Codebase Mapper API",
+    version="1.0.0",
+    description="Deterministic AST code analysis paired with AI architectural summaries."
+)
 
-# Enable CORS for local frontend development (Vite runs on port 5173 typically)
+# Enable CORS for local React/Vite development
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -13,10 +17,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Include our analysis routes
+app.include_router(api_router, prefix="/api")
+
 @app.get("/")
 def read_root():
-    return {"message": "AI Codebase Mapper API is running", "status": "active"}
-
-@app.get("/health")
-def health_check():
-    return {"status": "healthy"}
+    return {"message": "AI Codebase Mapper Backend is running successfully!"}
