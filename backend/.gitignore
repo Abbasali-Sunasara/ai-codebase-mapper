@@ -1,6 +1,8 @@
 # === Environment & Secrets ===
 .env
 .env.local
+.cache/
+*.sqlite3
 
 # === Python / Backend ===
 # Virtual environments

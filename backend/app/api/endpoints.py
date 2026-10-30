@@ -1,63 +1,68 @@
+import os
 import shutil
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+import traceback
+from uuid import uuid4
 
-# Import our custom backend services
-from app.services.repo_cloner import clone_repository
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from pydantic import BaseModel, HttpUrl
+
+from app.jobs import create_job, get_job, update_job
 from app.services.ast_parser import analyze_repository_ast
-from app.core.ai_client import ai_client
+from app.services.cache import cache
+from app.services.repo_cloner import clone_repository, repository_commit_sha
+from app.services.summarizer import summarize_metadata
 
 router = APIRouter()
 
-class RepoAnalyzeRequest(BaseModel):
-    repo_url: str
 
-@router.post("/analyze")
-async def analyze_codebase(payload: RepoAnalyzeRequest):
-    """
-    Master pipeline endpoint:
-    1. Clone repository (repo_cloner creates its own temp dir)
-    2. Run deterministic AST parsing + NetworkX graph generation
-    3. Generate AI code summaries
-    4. Cleanup and return graph data
-    """
+class RepoAnalyzeRequest(BaseModel):
+    repo_url: HttpUrl
+
+
+def _analyze_repository(repo_url: str, job_id: str) -> None:
     temp_dir = None
     try:
-        # Step 1: Clone the repository (returns the temp directory path)
-        temp_dir = clone_repository(payload.repo_url)
+        update_job(job_id, status="cloning")
+        temp_dir = clone_repository(repo_url)
+        commit_sha = repository_commit_sha(temp_dir)
+        cached = cache.get_analysis(f"v4:{commit_sha}")
+        if cached is not None:
+            cached["repo_url"] = repo_url
+            update_job(job_id, status="done", result=cached)
+            return
 
-        # Step 2: Run AST parser and build structural graph
-        analysis_result = analyze_repository_ast(temp_dir)
-
-        # Step 3: (Optional enrichment) Summarize key files using AI client
-        file_metadata = analysis_result.get("file_metadata", {})
-        enriched_summaries = {}
-
-        count = 0
-        for path, data in file_metadata.items():
-            if count >= 3:
-                break
-            if isinstance(data, dict) and "error" not in data and (data.get("classes") or data.get("functions")):
-                summary = ai_client.explain_code_component(
-                    file_path=path,
-                    code_snippet=f"Classes: {data.get('classes')}, Functions: {data.get('functions')}",
-                    metadata=data
-                )
-                enriched_summaries[path] = summary
-                count += 1
-
-        analysis_result["ai_summaries"] = enriched_summaries
-
-        return {
-            "status": "success",
-            "repo_url": payload.repo_url,
-            "analysis": analysis_result
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis pipeline failed: {str(e)}")
-    
+        update_job(job_id, status="parsing")
+        analysis = analyze_repository_ast(temp_dir)
+        update_job(job_id, status="analyzing")
+        update_job(job_id, status="summarizing")
+        analysis["ai_summaries"] = summarize_metadata(analysis.get("file_metadata", {}), temp_dir)
+        result = {"status": "success", "repo_url": repo_url, "commit_sha": commit_sha, "analysis": analysis}
+        unavailable = ("AI summarization unavailable:", "Summary withheld:")
+        if not any(summary.startswith(unavailable) for summary in analysis["ai_summaries"].values()):
+            cache.put_analysis(f"v4:{commit_sha}", result)
+        update_job(job_id, status="done", result=result)
+    except HTTPException as error:
+        traceback.print_exc()
+        update_job(job_id, status="error", error=error.detail)
+    except Exception as error:
+        traceback.print_exc()
+        update_job(job_id, status="error", error=f"Analysis pipeline failed: {error}")
     finally:
-        # Always clean up temporary directory storage
-        if temp_dir and shutil.os.path.exists(temp_dir):
+        if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+@router.post("/analyze", status_code=status.HTTP_202_ACCEPTED)
+async def analyze_codebase(payload: RepoAnalyzeRequest, background_tasks: BackgroundTasks):
+    job_id = str(uuid4())
+    create_job(job_id)
+    background_tasks.add_task(_analyze_repository, str(payload.repo_url), job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@router.get("/jobs/{job_id}")
+async def read_analysis_job(job_id: str):
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Analysis job not found")
+    return job
