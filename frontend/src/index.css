@@ -45,6 +45,18 @@ button { color: inherit; }
 .repo-form button:disabled { opacity: .65; cursor: wait; }
 .notice { padding: 12px 15px; border: 1px solid #245941; border-radius: 10px; color: #a7f3d0; background: #0d261f; }
 .notice.error, .error-text { border-color: #703c4b; color: #fda4af; background: #2a1720; }
+.analysis-progress { max-height: 0; margin: 0; overflow: hidden; opacity: 0; transform: translateY(-8px); visibility: hidden; transition: max-height .32s ease, margin .32s ease, opacity .24s ease, transform .24s ease, visibility .24s; }
+.analysis-progress--visible { max-height: 110px; margin: 0 0 18px; opacity: 1; transform: translateY(0); visibility: visible; transition-delay: 0s; }
+.analysis-progress__card { display: flex; align-items: center; gap: 14px; padding: 13px 16px; border: 1px solid rgba(52, 211, 153, .32); border-radius: 12px; background: linear-gradient(105deg, rgba(15, 38, 35, .96), rgba(15, 29, 43, .98) 55%, rgba(13, 28, 39, .98)); box-shadow: 0 10px 30px rgba(0, 0, 0, .2), inset 0 1px rgba(255, 255, 255, .025), 0 0 24px rgba(16, 185, 129, .06); }
+.analysis-progress__spinner { width: 22px; height: 22px; flex: 0 0 22px; border: 2px solid #294253; border-top-color: #34d399; border-right-color: #22d3ee; border-radius: 50%; animation: analysis-spin .85s linear infinite; box-shadow: 0 0 14px rgba(52, 211, 153, .13); }
+.analysis-progress__content { min-width: 0; flex: 1; }
+.analysis-progress__meta { display: flex; justify-content: space-between; gap: 12px; color: #76daba; font-size: .62rem; font-weight: 800; letter-spacing: .13em; }
+.analysis-progress__meta span:last-child { color: #8298aa; white-space: nowrap; }
+.analysis-progress__message { margin: 4px 0 9px; color: #e1edf5; font-size: .86rem; line-height: 1.35; }
+.analysis-progress__track { height: 4px; overflow: hidden; border-radius: 99px; background: #203445; }
+.analysis-progress__track > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #10b981, #34d399 58%, #22d3ee); box-shadow: 0 0 12px rgba(34, 211, 238, .3); transition: width .48s cubic-bezier(.2,.8,.2,1); }
+@keyframes analysis-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .analysis-progress, .analysis-progress__track > span { transition-duration: .01ms; } .analysis-progress__spinner { animation-duration: 2.5s; } }
 .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 12px; margin: 24px 0; }
 .metrics article, .flow-canvas, .inspector { border: 1px solid var(--border); border-radius: 16px; background: linear-gradient(145deg, rgba(20, 31, 46, .98), rgba(14, 22, 33, .98)); box-shadow: var(--shadow); }
 .metrics article { min-height: 88px; padding: 16px 18px; display: flex; flex-direction: column; justify-content: space-between; align-items: flex-start; gap: 8px; color: var(--text-muted); font-size: .8rem; }
@@ -52,7 +64,8 @@ button { color: inherit; }
 .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 350px; gap: 16px; align-items: stretch; }
 .flow-canvas, .inspector { min-width: 0; padding: 22px; }
 .flow-canvas { overflow: hidden; }
-.react-flow-frame { height: min(72vh, 760px); min-height: 500px; margin-top: 16px; border: 1px solid #25364a; border-radius: 12px; overflow: hidden; background-color: #0b1320; background-image: radial-gradient(#29384b 1px, transparent 1px); background-size: 22px 22px; }
+.react-flow-frame { position: relative; height: min(72vh, 760px); min-height: 500px; margin-top: 16px; border: 1px solid #25364a; border-radius: 12px; overflow: hidden; background-color: #0b1320; background-image: radial-gradient(#29384b 1px, transparent 1px); background-size: 22px 22px; }
+.canvas-layout-status { position: absolute; inset: 0; z-index: 5; display: grid; place-items: center; color: #bfccda; background: rgba(8, 13, 22, .52); font-size: .9rem; font-weight: 650; letter-spacing: .02em; pointer-events: none; backdrop-filter: blur(2px); }
 .react-flow { --xy-background-color: #0b1320; --xy-controls-button-background-color: #142131; --xy-controls-button-color: #cbd5e1; --xy-controls-button-border-color: #314258; --xy-minimap-background-color: #101a28; --xy-minimap-mask-background-color: rgba(3, 8, 15, .62); --xy-minimap-node-background-color: #30475f; --xy-minimap-node-stroke-color: #8aa0b8; --xy-edge-stroke: #62758b; --xy-edge-stroke-width: 1.5; }
 .react-flow__controls { overflow: hidden; border: 1px solid #34465b !important; border-radius: 10px !important; box-shadow: 0 8px 24px rgba(0, 0, 0, .25) !important; }
 .react-flow__controls-button { border-bottom: 1px solid #34465b !important; }
@@ -64,7 +77,12 @@ button { color: inherit; }
 .react-flow__minimap { overflow: hidden; border: 1px solid #34465b !important; border-radius: 10px !important; box-shadow: 0 8px 24px rgba(0, 0, 0, .25); }
 .react-flow__attribution { background: rgba(8, 13, 22, .75) !important; color: #718198 !important; }
 .folder-node-label { width: 100%; height: 100%; padding: 8px 10px; border: 1px dashed #42634f; border-radius: 10px; color: #a7f3d0; background: rgba(16, 39, 34, .43); font-size: .72rem; font-weight: 700; letter-spacing: .04em; pointer-events: none; }
-.module-node-title { margin-bottom: 3px; color: #f1f5f9; font-size: 13px; font-weight: 700; line-height: 16px; overflow-wrap: anywhere; }
+.module-node-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 7px; min-width: 0; margin-bottom: 3px; }
+.module-node-title { min-width: 0; flex: 1; color: #f1f5f9; font-size: 13px; font-weight: 700; line-height: 16px; overflow-wrap: anywhere; }
+.language-badge { display: inline-flex; width: fit-content; flex: 0 0 auto; align-items: center; justify-content: center; padding: 4px 8px; border: 1px solid; border-radius: 999px; font-size: .68rem; font-weight: 750; letter-spacing: .035em; line-height: 1.2; white-space: nowrap; box-shadow: inset 0 1px rgba(255, 255, 255, .035); }
+.language-badge--compact { min-width: 29px; padding: 2px 6px; font-size: 8px; line-height: 12px; }
+.inspector-language-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 12px 0 13px; }
+.inspector-file-type { color: #9aabc0; font-size: .75rem; }
 .module-node-evidence { margin-bottom: 9px; color: #91a3b8; font-size: 10px; line-height: 14px; overflow-wrap: anywhere; }
 .module-node-badges { display: flex; flex-direction: column; gap: 4px; }
 .module-pill { width: fit-content; max-width: 100%; padding: 2px 7px; border: 1px solid transparent; border-radius: 6px; font-size: 9px; font-weight: 600; line-height: 13px; overflow-wrap: anywhere; }

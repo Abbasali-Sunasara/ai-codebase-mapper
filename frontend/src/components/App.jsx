@@ -10,6 +10,7 @@ export default function App() {
   const [repoUrl, setRepoUrl] = useState('');
   const [loading, setLoading] = useState(false);
   const [jobStatus, setJobStatus] = useState('');
+  const [layoutStatus, setLayoutStatus] = useState('idle');
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
   const [selectedFile, setSelectedFile] = useState('');
@@ -18,11 +19,13 @@ export default function App() {
     event.preventDefault();
     setLoading(true);
     setJobStatus('queued');
+    setLayoutStatus('idle');
     setError('');
     setResult(null);
     setSelectedFile('');
     try {
       const data = await analyzeRepository(repoUrl.trim(), setJobStatus);
+      setLayoutStatus('layout');
       setResult(data);
       setSelectedFile(Object.keys(data.analysis.file_metadata)[0] || '');
     } catch (err) {
@@ -39,11 +42,11 @@ export default function App() {
         <input type="url" value={repoUrl} onChange={(event) => setRepoUrl(event.target.value)} placeholder="https://github.com/owner/repository" required aria-label="GitHub repository URL" />
         <button type="submit" disabled={loading}>{loading ? 'Analyzing…' : 'Map architecture'}</button>
       </form>
-      <JobStatus loading={loading} status={jobStatus} error={error} />
+      <JobStatus loading={loading} status={jobStatus} layoutStatus={layoutStatus} error={error} />
       {result && <>
         <MetricsPanel analysis={result.analysis} />
         <section className="workspace">
-          <FlowCanvas analysis={result.analysis} selectedFile={selectedFile} onSelectFile={setSelectedFile} />
+          <FlowCanvas analysis={result.analysis} selectedFile={selectedFile} onSelectFile={setSelectedFile} onLayoutStatusChange={setLayoutStatus} />
           <InspectorSidebar analysis={result.analysis} selectedFile={selectedFile} />
         </section>
       </>}

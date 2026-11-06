@@ -1,16 +1,31 @@
 import ast
+from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 import os
+from pathlib import Path
 from typing import Any
 
+from app.services.cache import cache
 from app.services.classifier import classify_file, classify_file_roles
-from app.services.graph_builder import build_dependency_graph, build_module_alias_index
+from app.services.graph_builder import (
+    _all_language_alias_index,
+    _resolve_non_python_import,
+    build_dependency_graph,
+    build_module_alias_index,
+)
 from app.services.graph_metrics import calculate_graph_metrics
-from app.services.security_scanner import scan_repository_security
+from app.services.security_scanner import scan_file_security_findings, scan_repository_security
+from app.services.parser_router import language_for_path, parse_tree_sitter_file
 
 
 SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "env", "build", "dist", "__pycache__", "site-packages"}
 HTTP_ROUTE_METHODS = {"get", "post", "put", "patch", "delete", "options", "head"}
 ROUTE_DECORATORS = HTTP_ROUTE_METHODS | {"route", "api_route", "websocket", "websocket_route"}
+FILE_SCAN_CACHE_VERSION = "static-v2"
+
+
+def _worker_count() -> int:
+    return min(32, (os.cpu_count() or 1) + 4)
 
 
 def _expression_name(node: ast.AST) -> str:
@@ -196,74 +211,273 @@ class CodebaseASTParser(ast.NodeVisitor):
                 self.import_evidence.append({"module": f"{node.module}.{alias.name}", "line": node.lineno, "kind": "from_member"})
 
 
-def analyze_repository_ast(repo_path: str) -> dict[str, Any]:
-    """Parse Python files and return metadata plus file-to-file import edges."""
-    file_metadata: dict[str, dict[str, Any]] = {}
+def _parse_python_source(relative: str, source: str) -> dict[str, Any]:
+    tree = ast.parse(source, filename=relative)
+    parser = CodebaseASTParser()
+    parser.visit(tree)
+    routes_by_symbol: dict[tuple, list[dict[str, Any]]] = {}
+    for route in parser.routes:
+        identity = (route["name"], route["line"], route["scope"])
+        routes_by_symbol.setdefault(identity, []).append(route)
+    for symbol in parser.symbols:
+        identity = (symbol["name"], symbol["line"], symbol["scope"])
+        symbol_routes = routes_by_symbol.get(identity, [])
+        symbol["classification"] = classify_file(relative, [symbol], symbol_routes)
+        symbol["classifications"] = classify_file_roles(relative, [symbol], symbol_routes)
+    return {
+        "file_path": relative,
+        "file_type": "python",
+        "parser_language": "python",
+        "classes": parser.classes,
+        "functions": parser.functions,
+        "imports": list(dict.fromkeys(parser.imports)),
+        "exports_or_includes": [],
+        "line_numbers": {
+            "classes": [symbol["line"] for symbol in parser.symbols if symbol["kind"] == "class"],
+            "functions": [symbol["line"] for symbol in parser.symbols if symbol["kind"] == "function"],
+            "imports": list(dict.fromkeys(item["line"] for item in parser.import_evidence)),
+            "exports_or_includes": [],
+        },
+        "import_evidence": parser.import_evidence,
+        "symbols": parser.symbols,
+        "routes": parser.routes,
+        "line_count": len(source.splitlines()),
+        "classification": classify_file(relative, parser.symbols, parser.routes),
+        "classifications": classify_file_roles(relative, parser.symbols, parser.routes),
+    }
+
+
+def _python_error_metadata(relative: str, error: Exception) -> dict[str, Any]:
+    return {
+        "file_path": relative,
+        "file_type": "python",
+        "parser_language": "python",
+        "classes": [],
+        "functions": [],
+        "imports": [],
+        "import_evidence": [],
+        "exports_or_includes": [],
+        "line_numbers": {"classes": [], "functions": [], "imports": [], "exports_or_includes": []},
+        "symbols": [],
+        "routes": [],
+        "line_count": 0,
+        "classification": "source",
+        "classifications": ["source"],
+        "error": str(error),
+        "line": getattr(error, "lineno", None),
+    }
+
+
+def _file_cache_get(namespace: str, relative: str, **lookup: Any) -> dict | None:
+    try:
+        return cache.get_file_scan(namespace, relative, **lookup)
+    except Exception:
+        return None
+
+
+def _file_cache_put(
+    namespace: str,
+    relative: str,
+    content_hash: str,
+    stat: os.stat_result,
+    snapshot_id: str | None,
+    metadata: dict,
+    findings: list[dict],
+) -> None:
+    try:
+        cache.put_file_scan(
+            namespace,
+            relative,
+            content_hash,
+            stat.st_mtime_ns,
+            stat.st_size,
+            snapshot_id=snapshot_id,
+            ast_metadata=metadata,
+            security_findings=findings,
+        )
+    except Exception:
+        return
+
+
+def _parse_python_file(args: tuple[str, str, str, str | None]) -> tuple[str, dict[str, Any]]:
+    repo_path, relative, namespace, snapshot_id = args
+    full_path = Path(repo_path) / relative
+    try:
+        stat = full_path.stat()
+    except OSError as error:
+        return relative, _python_error_metadata(relative, error)
+
+    cached_by_stat = _file_cache_get(
+        namespace,
+        relative,
+        mtime_ns=stat.st_mtime_ns,
+        size=stat.st_size,
+        snapshot_id=snapshot_id,
+    )
+    if cached_by_stat and cached_by_stat.get("ast_metadata") is not None and cached_by_stat.get("security_findings") is not None:
+        return relative, cached_by_stat["ast_metadata"]
+
+    try:
+        raw = full_path.read_bytes()
+        source = raw.decode("utf-8")
+    except (OSError, UnicodeError) as error:
+        return relative, _python_error_metadata(relative, error)
+
+    content_hash = sha256(raw).hexdigest()
+    cached_by_hash = _file_cache_get(namespace, relative, content_hash=content_hash)
+    metadata = (cached_by_stat or {}).get("ast_metadata") or (cached_by_hash or {}).get("ast_metadata")
+    findings = (cached_by_stat or {}).get("security_findings")
+    if findings is None:
+        findings = (cached_by_hash or {}).get("security_findings")
+
+    if metadata is None:
+        try:
+            metadata = _parse_python_source(relative, source)
+        except (SyntaxError, ValueError) as error:
+            metadata = _python_error_metadata(relative, error)
+    if findings is None:
+        findings = scan_file_security_findings(relative, source)
+
+    _file_cache_put(namespace, relative, content_hash, stat, snapshot_id, metadata, findings)
+    return relative, metadata
+
+
+def _parse_tree_sitter_file(args: tuple[str, str, str, str | None]) -> tuple[str, dict[str, Any]]:
+    """Parse one non-Python source file while reusing the existing per-file cache."""
+    repo_path, relative, namespace, snapshot_id = args
+    language = language_for_path(relative) or "source"
+    full_path = Path(repo_path) / relative
+    try:
+        stat = full_path.stat()
+    except OSError as error:
+        return relative, {"file_path": relative, "file_type": language, "error": str(error)}
+
+    cached_by_stat = _file_cache_get(
+        namespace, relative, mtime_ns=stat.st_mtime_ns, size=stat.st_size, snapshot_id=snapshot_id
+    )
+    if cached_by_stat and cached_by_stat.get("ast_metadata") is not None:
+        return relative, cached_by_stat["ast_metadata"]
+
+    try:
+        raw = full_path.read_bytes()
+        source = raw.decode("utf-8")
+    except (OSError, UnicodeError) as error:
+        return relative, {"file_path": relative, "file_type": language, "error": str(error)}
+
+    content_hash = sha256(raw).hexdigest()
+    cached_by_hash = _file_cache_get(namespace, relative, content_hash=content_hash)
+    metadata = (cached_by_stat or {}).get("ast_metadata") or (cached_by_hash or {}).get("ast_metadata")
+    findings = (cached_by_stat or {}).get("security_findings")
+    if findings is None:
+        findings = (cached_by_hash or {}).get("security_findings")
+    if metadata is None:
+        try:
+            metadata = parse_tree_sitter_file(relative, source)
+        except (ImportError, OSError, ValueError, RuntimeError) as error:
+            # A missing/broken optional native grammar should not take down a full
+            # repository analysis; preserve a visible, normalized file record.
+            metadata = {
+                "file_path": relative,
+                "file_type": language,
+                "parser_language": language,
+                "classes": [], "functions": [], "imports": [],
+                "exports_or_includes": [],
+                "line_numbers": {"classes": [], "functions": [], "imports": [], "exports_or_includes": []},
+                "import_evidence": [], "symbols": [], "routes": [],
+                "line_count": len(source.splitlines()),
+                "classification": "source", "classifications": ["source"],
+                "error": f"Tree-sitter parse unavailable: {error}",
+            }
+    if findings is None:
+        findings = scan_file_security_findings(relative, source)
+    _file_cache_put(namespace, relative, content_hash, stat, snapshot_id, metadata, findings)
+    return relative, metadata
+
+
+def _python_file_paths(repo_path: str) -> list[str]:
+    paths: list[str] = []
     for root, dirs, files in os.walk(repo_path):
-        dirs[:] = [name for name in dirs if name not in SKIP_DIRS and not name.startswith(".")]
-        for filename in files:
+        dirs[:] = sorted(name for name in dirs if name not in SKIP_DIRS and not name.startswith("."))
+        for filename in sorted(files):
             if not filename.endswith(".py"):
                 continue
             full_path = os.path.join(root, filename)
-            if os.path.islink(full_path):
-                continue
-            relative = os.path.relpath(full_path, repo_path).replace(os.sep, "/")
-            try:
-                with open(full_path, encoding="utf-8") as source_file:
-                    source = source_file.read()
-                tree = ast.parse(source, filename=relative)
-                parser = CodebaseASTParser()
-                parser.visit(tree)
-                routes_by_symbol: dict[tuple, list[dict[str, Any]]] = {}
-                for route in parser.routes:
-                    identity = (route["name"], route["line"], route["scope"])
-                    routes_by_symbol.setdefault(identity, []).append(route)
-                for symbol in parser.symbols:
-                    identity = (symbol["name"], symbol["line"], symbol["scope"])
-                    symbol_routes = routes_by_symbol.get(identity, [])
-                    symbol["classification"] = classify_file(relative, [symbol], symbol_routes)
-                    symbol["classifications"] = classify_file_roles(relative, [symbol], symbol_routes)
-                file_metadata[relative] = {
-                    "file_type": "python",
-                    "classes": parser.classes,
-                    "functions": parser.functions,
-                    "imports": list(dict.fromkeys(parser.imports)),
-                    "import_evidence": parser.import_evidence,
-                    "symbols": parser.symbols,
-                    "routes": parser.routes,
-                    "line_count": len(source.splitlines()),
-                    "classification": classify_file(relative, parser.symbols, parser.routes),
-                    "classifications": classify_file_roles(relative, parser.symbols, parser.routes),
-                }
-            except (OSError, UnicodeError, SyntaxError, ValueError) as error:
-                file_metadata[relative] = {
-                    "file_type": "python",
-                    "error": str(error),
-                    "line": getattr(error, "lineno", None),
-                }
+            if not os.path.islink(full_path):
+                paths.append(os.path.relpath(full_path, repo_path).replace(os.sep, "/"))
+    return sorted(paths)
 
-    security_analysis = scan_repository_security(repo_path, file_metadata)
+
+def _tree_sitter_file_paths(repo_path: str) -> list[str]:
+    paths: list[str] = []
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = sorted(name for name in dirs if name not in SKIP_DIRS and not name.startswith("."))
+        for filename in sorted(files):
+            relative = os.path.relpath(os.path.join(root, filename), repo_path).replace(os.sep, "/")
+            if language_for_path(relative) and not os.path.islink(os.path.join(root, filename)):
+                paths.append(relative)
+    return sorted(paths)
+
+
+def analyze_repository_ast(
+    repo_path: str,
+    cache_namespace: str | None = None,
+    snapshot_id: str | None = None,
+) -> dict[str, Any]:
+    """Parse Python files concurrently, reusing content-addressed per-file results."""
+    root = Path(repo_path)
+    namespace = f"{cache_namespace or str(root.resolve())}:{FILE_SCAN_CACHE_VERSION}"
+    python_paths = _python_file_paths(repo_path)
+    tree_sitter_paths = _tree_sitter_file_paths(repo_path)
+    worker_args = ((repo_path, relative, namespace, snapshot_id) for relative in python_paths)
+    with ThreadPoolExecutor(max_workers=_worker_count(), thread_name_prefix="ast-parse") as executor:
+        parsed = list(executor.map(_parse_python_file, worker_args))
+    file_metadata = {relative: metadata for relative, metadata in parsed}
+
+    tree_sitter_args = ((repo_path, relative, namespace, snapshot_id) for relative in tree_sitter_paths)
+    with ThreadPoolExecutor(max_workers=_worker_count(), thread_name_prefix="tree-sitter-parse") as executor:
+        file_metadata.update(executor.map(_parse_tree_sitter_file, tree_sitter_args))
+
+    security_analysis = scan_repository_security(
+        repo_path,
+        file_metadata,
+        cache_namespace=namespace,
+        snapshot_id=snapshot_id,
+    )
     python_file_paths = [
         path for path, metadata in file_metadata.items()
         if metadata.get("file_type") == "python" and not metadata.get("error")
     ]
     module_index = build_module_alias_index(python_file_paths)
+    all_language_aliases = _all_language_alias_index(file_metadata)
     for path, metadata in file_metadata.items():
         if metadata.get("error"):
             continue
         internal, external = [], []
-        for imported in metadata["imports"]:
-            normalized = imported.lstrip(".")
-            destination = internal if normalized in module_index else external
-            destination.append(imported)
+        is_python = metadata.get("file_type") == "python"
+        for imported in metadata.get("imports", []):
+            if is_python:
+                normalized = imported.lstrip(".")
+                is_internal = normalized in module_index
+            else:
+                is_internal = _resolve_non_python_import(
+                    path, imported, all_language_aliases
+                ) is not None
+            (internal if is_internal else external).append(imported)
         metadata["internal_imports"] = list(dict.fromkeys(internal))
         metadata["external_imports"] = list(dict.fromkeys(external))
+        metadata.setdefault("file_path", path)
+        metadata.setdefault("exports_or_includes", [])
+        metadata.setdefault("line_numbers", {"classes": [], "functions": [], "imports": [], "exports_or_includes": []})
+        metadata.setdefault("file_symbols", metadata.get("symbols", []))
 
     nodes, edges = build_dependency_graph(file_metadata)
     module_nodes = [node for node in nodes if node["type"] == "module"]
     module_edges = [edge for edge in edges if edge["type"] == "imports"]
-    python_module_nodes = [node for node in module_nodes if node.get("file_type") == "python"]
-    metrics = calculate_graph_metrics(python_module_nodes, module_edges)
+    parsed_language_nodes = [
+        node for node in module_nodes
+        if node.get("file_type") in {"python", "javascript", "typescript", "tsx", "c", "cpp", "java"}
+    ]
+    metrics = calculate_graph_metrics(parsed_language_nodes, module_edges)
     return {
         "nodes_count": len(module_nodes),
         "edges_count": len(module_edges),

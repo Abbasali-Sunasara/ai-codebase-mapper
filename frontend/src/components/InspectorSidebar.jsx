@@ -1,3 +1,5 @@
+import LanguageBadge from './LanguageBadge.jsx';
+
 export default function InspectorSidebar({ analysis, selectedFile }) {
   const metadata = analysis.file_metadata?.[selectedFile];
   const summary = analysis.ai_summaries?.[selectedFile];
@@ -15,11 +17,14 @@ export default function InspectorSidebar({ analysis, selectedFile }) {
       <h2>{selectedFile || 'Select a file'}</h2>
       {metadata?.error ? <p className="error-text">{metadata.error}</p> : metadata ? (
         <>
+          <div className="inspector-language-row">
+            <LanguageBadge filePath={selectedFile} fileType={metadata.file_type} />
+            <span className="inspector-file-type">File type: {metadata.file_type || 'source'}</span>
+          </div>
           <div className="classification-list">
             {classifications.map((role) => (
               <span className={`classification${role === 'infrastructure' || role === 'config' ? ' classification--infrastructure' : ''}`} key={role}>{role}</span>
             ))}
-            {metadata.file_type && <span className="classification classification--muted">{metadata.file_type}</span>}
           </div>
           <div className="detail">
             <h3>Module dependencies</h3>

@@ -4,6 +4,8 @@ import '@xyflow/react/dist/style.css';
 import { createPortal } from 'react-dom';
 import { Maximize2, Minimize2 } from 'lucide-react';
 import { arrangeFiles } from '../lib/layout.js';
+import LanguageBadge from './LanguageBadge.jsx';
+import { getLanguageInfo } from '../lib/language.js';
 
 const EMPTY_EDGES = [];
 const nodeTypes = { folder: FolderNode, module: ModuleNode };
@@ -67,6 +69,21 @@ function getVisibleBadgeLabels(metadata) {
     ...groups.imports.map((text) => `import ${text}`),
     ...(groups.hiddenImports.length ? [`+${groups.hiddenImports.length} more imports`] : []),
   ];
+}
+
+function hasEntries(value) {
+  if (Array.isArray(value) || typeof value === 'string') return value.length > 0;
+  return value != null && typeof value === 'object' && Object.keys(value).length > 0;
+}
+
+function isEmptyInitializer(node, metadata) {
+  const filePath = node.file || node.id || '';
+  if (filePath.split('/').at(-1) !== '__init__.py') return false;
+
+  const hasSymbols = [metadata.classes, metadata.functions, metadata.symbols].some(hasEntries);
+  const hasExports = [metadata.exports, metadata.exported_symbols, metadata.exported_names, metadata.__all__, node.exports].some(hasEntries);
+  const hasImports = hasEntries(metadata.imports) || hasEntries(metadata.import_evidence);
+  return !hasSymbols && !hasExports && !hasImports;
 }
 
 function OverflowBadge({ items, category }) {
@@ -186,7 +203,8 @@ function OverflowBadge({ items, category }) {
 }
 
 function estimateModuleHeight(node, metadata) {
-  const titleLines = estimatedTextLines(node.name || node.id, 27);
+  const hasLanguageBadge = Boolean(getLanguageInfo(node.file || node.id, metadata?.file_type || node.file_type));
+  const titleLines = estimatedTextLines(node.name || node.id, hasLanguageBadge ? 20 : 27);
   const badgeLabels = getVisibleBadgeLabels(metadata);
   const badgeHeight = badgeLabels.reduce((total, label) => total + 21 + (estimatedTextLines(label) - 1) * 13, 0);
   const badgeGaps = Math.max(0, badgeLabels.length - 1) * 4;
@@ -219,7 +237,8 @@ function ModuleNode({ data }) {
   });
 
   const warnings = fileMeta?.security_warnings || fileMeta?.heuristics || [];
-  const fileType = fileMeta?.file_type || 'python';
+  const fileType = fileMeta?.file_type || data.file_type || 'source';
+  const filePath = data.file || name;
 
   return (
     <div className={`custom-module-node custom-module-node--${fileType}`} style={{ width: '100%', boxSizing: 'border-box' }}>
@@ -235,9 +254,10 @@ function ModuleNode({ data }) {
         isConnectable={false}
         style={{ width: 8, height: 8, background: '#64748b', border: '1px solid #0b1320' }}
       />
-      {/* Module Title */}
-      <div className="module-node-title">
-        {name}
+      {/* File name and language are kept distinct for quick scanning. */}
+      <div className="module-node-heading">
+        <div className="module-node-title">{name}</div>
+        <LanguageBadge filePath={filePath} fileType={fileType} compact />
       </div>
       
       {/* Classification & Line Evidence */}
@@ -307,62 +327,87 @@ function ModuleNode({ data }) {
   );
 }
 
-export default function FlowCanvas({ analysis, selectedFile, onSelectFile }) {
+export default function FlowCanvas({ analysis, selectedFile, onSelectFile, onLayoutStatusChange }) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const reactFlowInstanceRef = useRef(null);
-  const files = Object.entries(analysis.file_metadata || {});
-  const graphNodes = analysis.module_nodes?.length
-    ? analysis.module_nodes
-    : files.map(([path]) => ({ id: path, file: path, name: path, type: 'module' }));
+  const files = useMemo(() => Object.entries(analysis.file_metadata || {}), [analysis.file_metadata]);
+  const graphNodes = useMemo(() => (
+    analysis.module_nodes?.length
+      ? analysis.module_nodes
+      : files.map(([path]) => ({ id: path, file: path, name: path, type: 'module' }))
+  ), [analysis.module_nodes, files]);
+  const visibleGraphNodes = useMemo(() => graphNodes.filter((node) => {
+    const filePath = node.file || node.id;
+    return !isEmptyInitializer(node, analysis.file_metadata?.[filePath] || {});
+  }), [graphNodes, analysis.file_metadata]);
   const graphEdges = analysis.module_edges || EMPTY_EDGES;
 
-  const nodes = useMemo(() => {
-    const nodesWithHeights = graphNodes.map((node) => {
-      const filePath = node.file || node.id;
-      const metadata = analysis.file_metadata?.[filePath] || {};
-      return { ...node, layoutHeight: estimateModuleHeight(node, metadata) };
+  const baseNodes = useMemo(() => visibleGraphNodes.map((node) => {
+    const filePath = node.file || node.id;
+    const fileMeta = analysis.file_metadata?.[filePath] || {};
+    const classification = node?.classification || node?.type || 'source';
+    const borderColor = CLASSIFICATION_COLORS[classification] || CLASSIFICATION_COLORS.source;
+    return {
+      id: node.id,
+      type: 'module',
+      position: { x: 0, y: 0 },
+      layoutHeight: estimateModuleHeight(node, fileMeta),
+      data: {
+        name: node?.name || node.id,
+        classification,
+        evidenceLine: node?.evidence?.line || 1,
+        file: filePath,
+        fileMeta,
+        file_type: fileMeta.file_type || node.file_type,
+        classifications: fileMeta.classifications || node.classifications || [],
+        security_warnings: fileMeta.security_warnings || fileMeta.heuristics || node.security_warnings || node.heuristics || [],
+        heuristics: fileMeta.heuristics || node.heuristics || [],
+        routes: fileMeta.routes || node.routes || [],
+        classes: fileMeta.classes || node.classes || [],
+        functions: fileMeta.functions || node.functions || [],
+      },
+      style: {
+        width: 220,
+        border: `1px solid ${borderColor}`,
+        borderRadius: 12,
+        padding: 12,
+        background: fileMeta.file_type === 'infrastructure' || fileMeta.file_type === 'config' ? '#171d27' : '#111b29',
+        fontSize: 12,
+        boxShadow: '0 8px 20px rgba(0,0,0,.25)',
+        transition: 'border-color .18s ease, box-shadow .18s ease, background .18s ease',
+      },
+    };
+  }), [visibleGraphNodes, analysis.file_metadata]);
+
+  const [layoutState, setLayoutState] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    onLayoutStatusChange?.('layout');
+    arrangeFiles(baseNodes, graphEdges).then((laidOut) => {
+      if (cancelled) return;
+      setLayoutState({ baseNodes, graphEdges, nodes: laidOut });
+      onLayoutStatusChange?.(laidOut.length ? 'rendering' : 'ready');
     });
+    return () => { cancelled = true; };
+  }, [baseNodes, graphEdges, onLayoutStatusChange]);
 
-    return arrangeFiles(nodesWithHeights, graphEdges).map((layoutNode) => {
-      if (layoutNode.type === 'folder') return layoutNode;
-      const { id, x, y, ...node } = layoutNode;
-      const filePath = node?.file || id;
-      const fileMeta = analysis.file_metadata?.[filePath] || {};
-      const isSelected = selectedFile === filePath;
-      const classification = node?.classification || node?.type || 'source';
-      const borderColor = CLASSIFICATION_COLORS[classification] || CLASSIFICATION_COLORS.source;
-
+  const layoutPending = !layoutState || layoutState.baseNodes !== baseNodes || layoutState.graphEdges !== graphEdges;
+  const nodes = useMemo(() => {
+    if (layoutPending) return [];
+    return layoutState.nodes.map((node) => {
+      if (node.type === 'folder') return node;
+      const isSelected = selectedFile === node.data.file;
+      const borderColor = CLASSIFICATION_COLORS[node.data.classification] || CLASSIFICATION_COLORS.source;
       return {
-        id,
-        position: { x, y },
-        type: 'module',
-        data: {
-          name: node?.name || id,
-          classification,
-          evidenceLine: node?.evidence?.line || 1,
-          file: filePath,
-          fileMeta,
-          file_type: fileMeta.file_type || node.file_type,
-          classifications: fileMeta.classifications || node.classifications || [],
-          security_warnings: fileMeta.security_warnings || fileMeta.heuristics || node.security_warnings || node.heuristics || [],
-          heuristics: fileMeta.heuristics || node.heuristics || [],
-          routes: fileMeta.routes || node.routes || [],
-          classes: fileMeta.classes || node.classes || [],
-          functions: fileMeta.functions || node.functions || []
-        },
+        ...node,
         style: {
-          width: 220,
+          ...node.style,
           border: isSelected ? '1px solid #34d399' : `1px solid ${borderColor}`,
-          borderRadius: 12,
-          padding: 12,
-          background: fileMeta.file_type === 'infrastructure' || fileMeta.file_type === 'config' ? '#171d27' : '#111b29',
-          fontSize: 12,
           boxShadow: isSelected ? '0 0 0 2px rgba(52, 211, 153, .12), 0 8px 24px rgba(0,0,0,.35)' : '0 8px 20px rgba(0,0,0,.25)',
-          transition: 'border-color .18s ease, box-shadow .18s ease, background .18s ease',
         },
       };
     });
-  }, [graphNodes, graphEdges, selectedFile, analysis.file_metadata]);
+  }, [layoutState, layoutPending, selectedFile]);
 
   const edges = useMemo(() => graphEdges
     .filter((edge) => nodes.some((node) => node.id === edge.source) && nodes.some((node) => node.id === edge.target))
@@ -381,10 +426,12 @@ export default function FlowCanvas({ analysis, selectedFile, onSelectFile }) {
         },
         labelStyle: {
           fill: '#cbd5e1',
-          fontSize: 11,
+          fontSize: 9,
           fontWeight: isConnectedToSelected ? '600' : '400',
         },
-        labelBgStyle: { fill: '#101a27', fillOpacity: 0.96 },
+        labelBgStyle: { fill: '#101a27', fillOpacity: 0.98 },
+        labelBgPadding: [4, 2],
+        labelBgBorderRadius: 4,
       };
     }), [graphEdges, nodes, selectedFile]);
 
@@ -403,18 +450,22 @@ export default function FlowCanvas({ analysis, selectedFile, onSelectFile }) {
   }, [isFullscreen]);
 
   useEffect(() => {
+    if (layoutPending || !nodes.length) return undefined;
     let secondFrame;
+    let readyTimer;
     const firstFrame = window.requestAnimationFrame(() => {
       secondFrame = window.requestAnimationFrame(() => {
         window.dispatchEvent(new Event('resize'));
         reactFlowInstanceRef.current?.fitView({ padding: 0.16, duration: 240 });
+        readyTimer = window.setTimeout(() => onLayoutStatusChange?.('ready'), 360);
       });
     });
     return () => {
       window.cancelAnimationFrame(firstFrame);
       if (secondFrame) window.cancelAnimationFrame(secondFrame);
+      if (readyTimer) window.clearTimeout(readyTimer);
     };
-  }, [isFullscreen]);
+  }, [isFullscreen, layoutPending, nodes.length, onLayoutStatusChange]);
 
   return (
     <section className={`flow-canvas${isFullscreen ? ' flow-canvas--fullscreen' : ''}`} aria-label="Codebase architecture graph">
@@ -423,14 +474,20 @@ export default function FlowCanvas({ analysis, selectedFile, onSelectFile }) {
           <p className="eyebrow">STRUCTURE</p>
           <h2>Module dependency graph</h2>
         </div>
-        <span>{graphNodes.length} modules · {edges.length} dependencies</span>
+        <span>{visibleGraphNodes.length} modules · {edges.length} dependencies</span>
       </div>
-      {files.length ? (
+      {visibleGraphNodes.length ? (
         <div className={`react-flow-frame${isFullscreen ? ' react-flow-frame--fullscreen' : ''}`}>
           <ReactFlow
             nodes={nodes}
             edges={edges}
             nodeTypes={nodeTypes}
+            defaultEdgeOptions={{
+              type: 'smoothstep',
+              labelBgStyle: { fill: '#101a27', fillOpacity: 0.98 },
+              labelBgPadding: [4, 2],
+              labelBgBorderRadius: 4,
+            }}
             className={isFullscreen ? 'react-flow-canvas--fullscreen' : undefined}
             style={{ width: '100%', height: '100%' }}
             fitView
@@ -454,7 +511,7 @@ export default function FlowCanvas({ analysis, selectedFile, onSelectFile }) {
           </ReactFlow>
         </div>
       ) : (
-        <p className="empty-state">No Python files were found in this repository.</p>
+        <p className="empty-state">No modules with classes, functions, exports, or imports were found.</p>
       )}
     </section>
   );

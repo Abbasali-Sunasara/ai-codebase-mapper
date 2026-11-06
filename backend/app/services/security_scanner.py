@@ -1,7 +1,10 @@
 """Deterministic security and infrastructure heuristics for repository snapshots."""
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
+from hashlib import sha256
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -9,12 +12,13 @@ from typing import Any
 import yaml
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
+from app.services.cache import cache
 from app.services.container_detector import detect_containers
 
 
 SKIP_DIRECTORIES = {".git", "node_modules", "venv", ".venv", "env", "build", "dist", "__pycache__", "site-packages"}
 SCANNABLE_EXTENSIONS = {
-    ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".json", ".yaml", ".yml",
+    ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".c", ".h", ".cpp", ".hpp", ".cc", ".java", ".json", ".yaml", ".yml",
     ".toml", ".ini", ".cfg", ".conf", ".env", ".sh", ".tf", ".properties", ".xml",
 }
 SECRET_NAME = r"(?:api[_-]?key|access[_-]?key|secret(?:[_-]?key)?|password|passwd|token|client[_-]?secret|private[_-]?key)"
@@ -295,6 +299,71 @@ def _source_findings(path: str, source: str) -> list[dict[str, Any]]:
     return findings
 
 
+def scan_file_security_findings(path: str, source: str) -> list[dict[str, Any]]:
+    """Expose deterministic source-level checks for the AST parser's worker."""
+    return _source_findings(path, source)
+
+
+def _cache_get(namespace: str, relative: str, **lookup: Any) -> dict | None:
+    try:
+        return cache.get_file_scan(namespace, relative, **lookup)
+    except Exception:
+        return None
+
+
+def _cache_put(
+    namespace: str,
+    relative: str,
+    content_hash: str,
+    stat: os.stat_result,
+    snapshot_id: str | None,
+    **results: Any,
+) -> None:
+    try:
+        cache.put_file_scan(
+            namespace,
+            relative,
+            content_hash,
+            stat.st_mtime_ns,
+            stat.st_size,
+            snapshot_id=snapshot_id,
+            **results,
+        )
+    except Exception:
+        # A cache failure should never fail deterministic repository analysis.
+        return
+
+
+def _scan_file_worker(args: tuple[str, str, str, str | None]) -> tuple[str, list[dict[str, Any]]]:
+    repo_path, relative, namespace, snapshot_id = args
+    full_path = Path(repo_path) / relative
+    try:
+        stat = full_path.stat()
+    except OSError:
+        return relative, []
+
+    stat_cache = _cache_get(namespace, relative, mtime_ns=stat.st_mtime_ns, size=stat.st_size, snapshot_id=snapshot_id)
+    if stat_cache and stat_cache.get("security_findings") is not None:
+        return relative, stat_cache["security_findings"]
+
+    try:
+        raw = full_path.read_bytes()
+        source = raw.decode("utf-8")
+    except (OSError, UnicodeError):
+        return relative, []
+
+    content_hash = sha256(raw).hexdigest()
+    content_cache = _cache_get(namespace, relative, content_hash=content_hash)
+    if content_cache and content_cache.get("security_findings") is not None:
+        findings = content_cache["security_findings"]
+        _cache_put(namespace, relative, content_hash, stat, snapshot_id, security_findings=findings)
+        return relative, findings
+
+    findings = _source_findings(relative, source)
+    _cache_put(namespace, relative, content_hash, stat, snapshot_id, security_findings=findings)
+    return relative, findings
+
+
 def _target_names(target: ast.AST) -> set[str]:
     if isinstance(target, ast.Name):
         return {target.id.lower()}
@@ -444,7 +513,10 @@ def _attach_finding_evidence(findings: list[dict[str, Any]], file_metadata: dict
 
 def _empty_file_metadata(path: str, line_count: int, file_type: str = "source") -> dict[str, Any]:
     return {
+        "file_path": path,
         "file_type": file_type,
+        "exports_or_includes": [],
+        "line_numbers": {"classes": [], "functions": [], "imports": [], "exports_or_includes": []},
         "classes": [],
         "functions": [],
         "imports": [],
@@ -461,21 +533,33 @@ def _empty_file_metadata(path: str, line_count: int, file_type: str = "source") 
     }
 
 
-def scan_security_findings(repo_path: str, file_metadata: dict | None = None) -> list[dict[str, Any]]:
+def _worker_count() -> int:
+    return min(32, (os.cpu_count() or 1) + 4)
+
+
+def scan_security_findings(
+    repo_path: str,
+    file_metadata: dict | None = None,
+    cache_namespace: str | None = None,
+    snapshot_id: str | None = None,
+) -> list[dict[str, Any]]:
     """Scan repository text, Python AST settings, and route auth metadata."""
     root = Path(repo_path)
-    findings: list[dict[str, Any]] = []
+    namespace = cache_namespace or str(root.resolve())
+    files: list[str] = []
     for path in root.rglob("*"):
         if path.is_symlink() or not path.is_file():
             continue
         relative = path.relative_to(root)
-        if _skip_path(relative) or not _is_scannable(path):
-            continue
-        try:
-            source = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            continue
-        findings.extend(_source_findings(relative.as_posix(), source))
+        if not _skip_path(relative) and _is_scannable(path):
+            files.append(relative.as_posix())
+    files.sort()
+
+    findings: list[dict[str, Any]] = []
+    worker_args = ((str(root), relative, namespace, snapshot_id) for relative in files)
+    with ThreadPoolExecutor(max_workers=_worker_count(), thread_name_prefix="security-scan") as executor:
+        for _, file_findings in executor.map(_scan_file_worker, worker_args):
+            findings.extend(file_findings)
 
     for file_path, metadata in (file_metadata or {}).items():
         if not isinstance(metadata, dict) or metadata.get("error"):
@@ -498,14 +582,28 @@ def scan_security_findings(repo_path: str, file_metadata: dict | None = None) ->
     for finding in findings:
         key = (finding["file"], finding["line"], finding["type"])
         unique.setdefault(key, finding)
+    try:
+        cache.prune_file_scans(namespace, files)
+    except Exception:
+        pass
     return sorted(unique.values(), key=lambda item: (item["file"], item["line"], item["type"]))
 
 
-def scan_repository_security(repo_path: str, file_metadata: dict[str, dict]) -> dict[str, Any]:
+def scan_repository_security(
+    repo_path: str,
+    file_metadata: dict[str, dict],
+    cache_namespace: str | None = None,
+    snapshot_id: str | None = None,
+) -> dict[str, Any]:
     """Attach per-file warnings and infrastructure/config roles to graph metadata."""
     root = Path(repo_path)
     container_files = detect_containers(repo_path)
-    findings = scan_security_findings(repo_path, file_metadata)
+    findings = scan_security_findings(
+        repo_path,
+        file_metadata,
+        cache_namespace=cache_namespace,
+        snapshot_id=snapshot_id,
+    )
     _attach_finding_evidence(findings, file_metadata)
     findings_by_file: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for finding in findings:

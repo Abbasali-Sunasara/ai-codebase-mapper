@@ -25,21 +25,21 @@ def _analyze_repository(repo_url: str, job_id: str) -> None:
         update_job(job_id, status="cloning")
         temp_dir = clone_repository(repo_url)
         commit_sha = repository_commit_sha(temp_dir)
-        cached = cache.get_analysis(f"v4:{commit_sha}")
+        cached = cache.get_analysis(f"v6:{commit_sha}")
         if cached is not None:
             cached["repo_url"] = repo_url
             update_job(job_id, status="done", result=cached)
             return
 
         update_job(job_id, status="parsing")
-        analysis = analyze_repository_ast(temp_dir)
+        analysis = analyze_repository_ast(temp_dir, cache_namespace=repo_url, snapshot_id=commit_sha)
         update_job(job_id, status="analyzing")
         update_job(job_id, status="summarizing")
         analysis["ai_summaries"] = summarize_metadata(analysis.get("file_metadata", {}), temp_dir)
         result = {"status": "success", "repo_url": repo_url, "commit_sha": commit_sha, "analysis": analysis}
         unavailable = ("AI summarization unavailable:", "Summary withheld:")
         if not any(summary.startswith(unavailable) for summary in analysis["ai_summaries"].values()):
-            cache.put_analysis(f"v4:{commit_sha}", result)
+            cache.put_analysis(f"v6:{commit_sha}", result)
         update_job(job_id, status="done", result=result)
     except HTTPException as error:
         traceback.print_exc()
