@@ -10,7 +10,9 @@ from app.jobs import create_job, get_job, update_job
 from app.services.ast_parser import analyze_repository_ast
 from app.services.cache import cache
 from app.services.repo_cloner import clone_repository, repository_commit_sha
-from app.services.summarizer import summarize_metadata
+# AI Summary can be re-enabled by uncommenting this import and the summarization
+# block below.
+# from app.services.summarizer import summarize_metadata
 
 router = APIRouter()
 
@@ -34,12 +36,15 @@ def _analyze_repository(repo_url: str, job_id: str) -> None:
         update_job(job_id, status="parsing")
         analysis = analyze_repository_ast(temp_dir, cache_namespace=repo_url, snapshot_id=commit_sha)
         update_job(job_id, status="analyzing")
-        update_job(job_id, status="summarizing")
-        analysis["ai_summaries"] = summarize_metadata(analysis.get("file_metadata", {}), temp_dir)
+        # AI Summary temporarily disabled; preserve the implementation for later.
+        # update_job(job_id, status="summarizing")
+        # analysis["ai_summaries"] = summarize_metadata(analysis.get("file_metadata", {}), temp_dir)
         result = {"status": "success", "repo_url": repo_url, "commit_sha": commit_sha, "analysis": analysis}
-        unavailable = ("AI summarization unavailable:", "Summary withheld:")
-        if not any(summary.startswith(unavailable) for summary in analysis["ai_summaries"].values()):
-            cache.put_analysis(f"v6:{commit_sha}", result)
+        # AI Summary results are not part of the cached analysis while disabled.
+        # unavailable = ("AI summarization unavailable:", "Summary withheld:")
+        # if not any(summary.startswith(unavailable) for summary in analysis["ai_summaries"].values()):
+        #     cache.put_analysis(f"v6:{commit_sha}", result)
+        cache.put_analysis(f"v6:{commit_sha}", result)
         update_job(job_id, status="done", result=result)
     except HTTPException as error:
         traceback.print_exc()

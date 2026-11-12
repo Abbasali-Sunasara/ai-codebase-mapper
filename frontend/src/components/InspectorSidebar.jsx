@@ -2,7 +2,8 @@ import LanguageBadge from './LanguageBadge.jsx';
 
 export default function InspectorSidebar({ analysis, selectedFile }) {
   const metadata = analysis.file_metadata?.[selectedFile];
-  const summary = analysis.ai_summaries?.[selectedFile];
+  // AI Summary UI can be re-enabled by uncommenting this line and its JSX below.
+  // const summary = analysis.ai_summaries?.[selectedFile];
   const fanMetrics = analysis.graph_metrics?.fan?.[selectedFile] || {};
   const routes = metadata?.routes || [];
   const risks = [
@@ -46,7 +47,9 @@ export default function InspectorSidebar({ analysis, selectedFile }) {
             <h3>Security findings <span className="finding-count">{risks.length}</span></h3>
             {risks.length ? risks.map((risk, index) => <p className="risk-line" key={`${risk.type}:${risk.line}:${index}`}><strong>{risk.severity || 'review'}</strong> · {risk.type} · L{risk.line}{risk.message ? ` — ${risk.message}` : ''}</p>) : <p>None detected</p>}
           </div>
+          {/* AI Summary UI temporarily disabled; preserve it for later.
           <div className="summary"><h3>AI summary</h3><p>{summary || 'No AI summary is available for this file.'}</p></div>
+          */}
         </>
       ) : <p className="empty-state">Choose a file to inspect its extracted metadata.</p>}
     </aside>
